@@ -44,15 +44,11 @@
    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
-// Core computation of Mandelbrot set membershop
-// Iterate complex number c to determine whether it diverges
-static inline int mandel(float c_re, float c_im, int count)
-{
+// Core computation of Mandelbrot set membership
+static inline int mandel(float c_re, float c_im, int count) {
     float z_re = c_re, z_im = c_im;
     int i;
     for (i = 0; i < count; ++i) {
-
         if (z_re * z_re + z_im * z_im > 4.f)
             break;
 
@@ -61,28 +57,13 @@ static inline int mandel(float c_re, float c_im, int count)
         z_re = c_re + new_re;
         z_im = c_im + new_im;
     }
-
     return i;
 }
 
-//
-// MandelbrotSerial --
-//
-// Compute an image visualizing the mandelbrot set.  The resulting
-// array contains the number of iterations required before the complex
-// number corresponding to a pixel could be rejected from the set.
-//
-// * x0, y0, x1, y1 describe the complex coordinates mapping
-//   into the image viewport.
-// * width, height describe the size of the output image
-// * startRow, endRow describe how much of the image to compute
-void mandelbrotSerial(
-    float x0, float y0, float x1, float y1,
-    int width, int height,
-    int startRow, int endRow,
-    int maxIterations,
-    int output[])
-{
+void mandelbrotSerial(float x0, float y0, float x1, float y1,
+                      int width, int height,
+                      int startRow, int endRow,
+                      int maxIterations, int output[]) {
     float dx = (x1 - x0) / width;
     float dy = (y1 - y0) / height;
 
@@ -90,15 +71,13 @@ void mandelbrotSerial(
         for (int i = 0; i < width; ++i) {
             float x = x0 + i * dx;
             float y = y0 + j * dy;
-
             int index = (j * width + i);
             output[index] = mandel(x, y, maxIterations);
         }
     }
 }
 
-
-// Struct for passing arguments to thread routine
+// Struct for passing arguments to the thread routine
 typedef struct {
     float x0, x1;
     float y0, y1;
@@ -108,40 +87,32 @@ typedef struct {
     int* output;
     int threadId;
     int numThreads;
+    int startRow, endRow; // Start and end rows for the thread
 } WorkerArgs;
 
-
-
-//
-// workerThreadStart --
-//
-// Thread entrypoint.
+// Thread entrypoint
 void* workerThreadStart(void* threadArgs) {
-
     WorkerArgs* args = static_cast<WorkerArgs*>(threadArgs);
+    double starttime = CycleTimer::currentSeconds();
 
-    // TODO: Implement worker thread here.
+    mandelbrotSerial(args->x0, args->y0, args->x1, args->y1,
+                     args->width, args->height,
+                     args->startRow, args->endRow,
+                     args->maxIterations, args->output);
 
-    printf("Hello world from thread %d\n", args->threadId);
-
+    double endtime = CycleTimer::currentSeconds();
+    printf("Thread %d: %f seconds\n", args->threadId, endtime - starttime);
     return NULL;
 }
 
-//
-// MandelbrotThread --
-//
-// Multi-threaded implementation of mandelbrot set image generation.
-// Multi-threading performed via pthreads.
-void mandelbrotThread(
-    int numThreads,
-    float x0, float y0, float x1, float y1,
-    int width, int height,
-    int maxIterations, int output[])
-{
+// Multi-threaded implementation of Mandelbrot set image generation
+void mandelbrotThread(int numThreads,
+                      float x0, float y0, float x1, float y1,
+                      int width, int height,
+                      int maxIterations, int output[]) {
     const static int MAX_THREADS = 32;
 
-    if (numThreads > MAX_THREADS)
-    {
+    if (numThreads > MAX_THREADS) {
         fprintf(stderr, "Error: Max allowed threads is %d\n", MAX_THREADS);
         exit(1);
     }
@@ -149,21 +120,43 @@ void mandelbrotThread(
     pthread_t workers[MAX_THREADS];
     WorkerArgs args[MAX_THREADS];
 
-    for (int i=0; i<numThreads; i++) {
-        // TODO: Set thread arguments here.
+    int rowsPerThread = height / numThreads; // 每个线程处理的行数
+    int remainingRows = height % numThreads; // 剩余行数
+
+    for (int i = 0; i < numThreads; i++) {
+        args[i].x0 = x0;
+        args[i].x1 = x1;
+        args[i].y0 = y0;
+        args[i].y1 = y1;
+        args[i].width = width;
+        args[i].height = height;
+        args[i].maxIterations = maxIterations;
         args[i].threadId = i;
+        args[i].numThreads = numThreads;
+        args[i].output = output;
+
+        // 计算每个线程的开始和结束行
+        args[i].startRow = i * rowsPerThread;
+        args[i].endRow = (i + 1) * rowsPerThread;
+        
+        // 最后一个线程处理剩余的行
+        if (i == numThreads - 1) {
+            args[i].endRow += remainingRows;
+        }
     }
 
-    // Fire up the worker threads.  Note that numThreads-1 pthreads
-    // are created and the main app thread is used as a worker as
-    // well.
-
-    for (int i=1; i<numThreads; i++)
+    // 创建线程
+    for (int i = 1; i < numThreads; i++) {
         pthread_create(&workers[i], NULL, workerThreadStart, &args[i]);
-
+    }
+    
+    // 主线程也作为一个工作线程
     workerThreadStart(&args[0]);
 
-    // wait for worker threads to complete
-    for (int i=1; i<numThreads; i++)
+ // 等待所有线程完成
+    for (int i = 1; i < numThreads; i++) {
         pthread_join(workers[i], NULL);
+    }
 }
+
+
