@@ -1,7 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <algorithm>
 
 void sqrtSerial(int N,
                 float initialGuess,
@@ -27,3 +27,29 @@ void sqrtSerial(int N,
     }
 }
 
+void initRandom(float *values, int N)
+{
+    for (int i=0; i<N; i++)
+    {
+        // random input values
+        values[i] = .001f + 2.998f * static_cast<float>(rand()) / RAND_MAX;
+    }
+}
+
+// Generate data that gives high relative speedup
+void initGood(float *values, int N) {
+    for (int i=0; i<N; i++)
+    {
+        // Todo: Choose values
+        values[i] = 2.998f;
+    }
+}
+
+// Generate data that gives low relative speedup
+void initBad(float *values, int N) {
+    for (int i=0; i<N; i++)
+    {
+        // Todo: Choose values
+        values[i] = i%8==0?2.99f:1.0f;
+    }
+}
