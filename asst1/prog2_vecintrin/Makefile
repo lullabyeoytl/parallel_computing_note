@@ -6,6 +6,10 @@ logger.o: logger.cpp logger.h CMU418intrin.h CMU418intrin.cpp
 CMU418intrin.o: CMU418intrin.cpp CMU418intrin.h logger.cpp logger.h
 	g++ -c CMU418intrin.cpp
 
+
+main.o: main.cpp CMU418intrin.h logger.h functions.h
+	g++ -c main.cpp
+
 vrun: CMU418intrin.o logger.o main.cpp functions.cpp
 	g++ -I../common logger.o CMU418intrin.o main.cpp functions.cpp -o vrun
 
