@@ -5,9 +5,8 @@
 #include "saxpy_ispc.h"
 
 extern void saxpySerial(int N, float a, float* X, float* Y, float* result);
+
 extern void saxpyStreaming(int N, float a, float* X, float* Y, float* result);
-
-
 // return GB/s
 static float
 toBW(int bytes, float sec) {
@@ -21,10 +20,12 @@ toGFLOPS(int ops, float sec) {
 
 using namespace ispc;
 
+
 int main() {
+
     const unsigned int N = 20 * 1000 * 1000; // 20 M element vectors (~80 MB)
     const unsigned int TOTAL_BYTES = 4 * N * sizeof(float);
-    const unsigned int TOTAL_FLOPS = N;
+    const unsigned int TOTAL_FLOPS = 2 * N;
 
     float scale = 2.f;
 
@@ -47,41 +48,19 @@ int main() {
     double minSerial = 1e30;
     for (int i = 0; i < 3; ++i) {
         double startTime =CycleTimer::currentSeconds();
-        saxpySerial(N, scale, arrayX, arrayY, result);
+        saxpyStreaming(N, scale, arrayX, arrayY, result);
         double endTime = CycleTimer::currentSeconds();
         minSerial = std::min(minSerial, endTime - startTime);
     }
 
     printf("[saxpy serial]:\t\t[%.3f] ms\t[%.3f] GB/s\t[%.3f] GFLOPS\n",
-           minSerial * 1000,
-           toBW(TOTAL_BYTES, minSerial),
-           toGFLOPS(TOTAL_FLOPS, minSerial));
+            minSerial * 1000,
+            toBW(TOTAL_BYTES, minSerial),
+            toGFLOPS(TOTAL_FLOPS, minSerial));
 
     // Clear out the buffer
     for (unsigned int i = 0; i < N; ++i)
         result[i] = 0.f;
-
-    //
-    // Run the streaming implementation. Repeat three times for robust
-    // timing.
-    //
-    double minStreaming = 1e30;
-    for (int i = 0; i < 3; ++i) {
-        double startTime =CycleTimer::currentSeconds();
-        saxpyStreaming(N, scale, arrayX, arrayY, result);
-        double endTime = CycleTimer::currentSeconds();
-        minStreaming = std::min(minStreaming, endTime - startTime);
-    }
-
-    printf("[saxpy streaming]:\t[%.3f] ms\t[%.3f] GB/s\t[%.3f] GFLOPS\n",
-           minStreaming * 1000,
-           toBW(TOTAL_BYTES, minStreaming),
-           toGFLOPS(TOTAL_FLOPS, minStreaming));
-
-    // Clear out the buffer
-    for (unsigned int i = 0; i < N; ++i)
-        result[i] = 0.f;
-
 
     //
     // Run the ISPC (single core) implementation
@@ -119,9 +98,13 @@ int main() {
            toBW(TOTAL_BYTES, minTaskISPC),
            toGFLOPS(TOTAL_FLOPS, minTaskISPC));
 
-    printf("\t\t\t\t(%.2fx speedup from streaming)\n", minSerial/minStreaming);
-    printf("\t\t\t\t(%.2fx speedup from ISPC)\n", minSerial/minISPC);
-    printf("\t\t\t\t(%.2fx speedup from task ISPC)\n", minSerial/minTaskISPC);
+    printf("\t\t\t\t(%.2fx speedup from use of tasks)\n", minISPC/minTaskISPC);
+    //printf("\t\t\t\t(%.2fx speedup from ISPC)\n", minSerial/minISPC);
+    //printf("\t\t\t\t(%.2fx speedup from task ISPC)\n", minSerial/minTaskISPC);
+
+    delete[] arrayX;
+    delete[] arrayY;
+    delete[] result;
 
     return 0;
 }
