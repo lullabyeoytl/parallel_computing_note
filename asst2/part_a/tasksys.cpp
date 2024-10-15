@@ -136,11 +136,13 @@ TaskState::TaskState(){
     num_total_tasks = -1;
     cv = new std::condition_variable();
     runnable = nullptr;
+    finishedMutex = new std::mutex();
 }
 
 TaskState::~TaskState(){
     delete mutex;
     delete cv;
+    delete finishedMutex;
 }
 
 const char* TaskSystemParallelThreadPoolSpinning::name() {
@@ -187,6 +189,8 @@ void TaskSystemParallelThreadPoolSpinning::worker() {
                 _task_states->num_completed.fetch_add(1);  // 原子加法
             {
                 if (_task_states->num_completed.load() == _task_states->num_total_tasks) {
+                    _task_states->finishedMutex->lock();
+                    _task_states->finishedMutex->unlock();
                     _task_states->cv->notify_all();  // 在持有锁时通知
                 }
             } // 自动解锁
@@ -196,12 +200,12 @@ void TaskSystemParallelThreadPoolSpinning::worker() {
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
     // 确保对共享数据的操作是线程安全的
+    std::unique_lock<std::mutex> lock(*_task_states->finishedMutex);
     _task_states->runnable = runnable;
     _task_states->num_total_tasks = num_total_tasks;
     _task_states->left_tasks.store(num_total_tasks);  // 使用原子操作
     _task_states->num_completed.store(0);  // 使用原子操作
 
-    std::unique_lock<std::mutex> lock(*_task_states->mutex);
     // 在持有锁的情况下等待条件变量
     _task_states->cv->wait(lock, [this]() { return _task_states->num_completed.load() == _task_states->num_total_tasks; });
     lock.unlock();
@@ -236,6 +240,15 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    _task_states = new TaskState;
+    _stop = false;
+    _threads_pool_ = new std::thread[num_threads];
+    _nums_threads_ = num_threads;
+    _hasTaskMutex = new std::mutex();
+    _hasTaskCV = new std::condition_variable();
+    for (int i = 0; i < num_threads; i++) {
+        _threads_pool_[i] = std::thread(&TaskSystemParallelThreadPoolSleeping::worker, this);
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -245,8 +258,43 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     // Implementations are free to add new class member variables
     // (requiring changes to tasksys.h).
     //
+    _stop = true;
+    for (int i = 0; i < _nums_threads_; i++){
+        _hasTaskCV->notify_all();
+    }
+    for (int i = 0; i < _nums_threads_; i++){
+        _threads_pool_[i].join();
+    }
+    delete _task_states;
+    delete[] _threads_pool_;
+    delete _hasTaskMutex;
 }
 
+void TaskSystemParallelThreadPoolSleeping::worker() {
+    int id;
+    int total;
+    while (!_stop){
+        _task_states->mutex->lock();
+        total = _task_states->num_total_tasks;
+        id = total - _task_states->left_tasks.load();  // 确保原子读取
+        if(id < total){
+            _task_states->left_tasks.fetch_sub(1);  // 原子递减
+        }
+        _task_states->mutex->unlock();
+        if(id <total ){
+            _task_states->mutex->unlock();
+            _task_states->finishedMutex->lock();
+            _task_states->finishedMutex->unlock();
+            _task_states->runnable->runTask(id, total);
+            _task_states->cv->notify_all();  // 在持有锁时通知
+        }
+        else{
+            std::unique_lock<std::mutex> lock(*_hasTaskMutex);
+            _hasTaskCV->wait(lock, [this]() { return _task_states->left_tasks.load() == 0; });
+            lock.unlock();
+        }
+    }
+}
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
 
 
@@ -255,10 +303,23 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // method in Parts A and B.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
-
+    std::unique_lock<std::mutex> lock(*_task_states->finishedMutex);
+    _task_states->mutex->lock();
+    _task_states->runnable = runnable;
+    _task_states->num_completed.store(0);  // 使用原子操作
+    _task_states->num_total_tasks = num_total_tasks;
+    _task_states->left_tasks.store(num_total_tasks);  // 使用原子操作
+    _task_states->mutex->unlock();
+    for (int i=0; i<num_total_tasks; i++){
+        _hasTaskCV->notify_all();
+    }
+    /** 
     for (int i = 0; i < num_total_tasks; i++) {
         runnable->runTask(i, num_total_tasks);
     }
+    */
+   _task_states->cv->wait(lock, [this]() { return _task_states->num_completed.load() == _task_states->num_total_tasks; });
+    lock.unlock();
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,

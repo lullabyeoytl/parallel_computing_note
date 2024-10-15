@@ -58,6 +58,7 @@ class TaskState{
         std::atomic<int> num_completed;  // 已完成的任务数
         std::condition_variable* cv;  // 条件变量
         std::mutex* mutex;  // 互斥锁
+        std::mutex* finishedMutex;;  // 依赖锁
         IRunnable* runnable;  // 任务函数
         int num_total_tasks;  // 总任务数
         TaskState();
@@ -94,10 +95,20 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();
         const char* name();
+        void worker();
         void run(IRunnable* runnable, int num_total_tasks);
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        TaskState* _task_states;  // 任务状态数组
+        std::thread* _threads_pool_;  // 线程池
+        int _nums_threads_;  // 线程数
+        bool _stop;  // 停止标志
+        std::condition_variable* _hasTaskCV;  // 条件变量
+        std::mutex * _hasTaskMutex;
+
 };
 
 #endif
