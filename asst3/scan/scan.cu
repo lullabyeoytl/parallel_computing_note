@@ -29,6 +29,25 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__
+void upsweep(int *data, int offset){
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    data[offset*(2*threadId+2)-1]+= data[offset*(2*threadId+1)-1];
+} 
+
+__global__
+void downsweep(int *data, int offset){
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    int temp = data[offset*(2*threadId+1)-1];
+    data[offset*(2*threadId+1)-1] = data[offset*(2*threadId+2)-1];
+    data[offset*(2*threadId+2)-1] = temp;
+}
+
+__global__
+void addzero(itn *data, int N){
+    data[N-1] = 0;
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +62,26 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+     int size = nextPow2(length);
+
+     int steps = 0;
+     while (size >> 1){
+        steps++;
+     }
+
+     int offset = 1;
+     for (int d = 0; d< steps; d++){
+        int numBlocks = (size / (2 * offset) + (size % (2 * offset) != 0)) ? 1 : 0;
+        upsweep<<<numBlocks, offset>>>(device_data, offset);
+     }
+
+    addzero<<<1, 1>>>(device_data, size);
+    
+    for (int d = steps - 1; d >= 0; d--) {
+        int offset = 1 << d;
+        int numBlocks = (size / (2 * offset) + (size % (2 * offset) != 0)) ? 1 : 0;
+        downsweep<<<numBlocks, offset>>>(device_data, offset);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -107,9 +146,37 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     double overallDuration = endTime - startTime;
     return overallDuration;
 }
+__global__
+void peak_check(int *data, int length, int *result){
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if(threadID ==0 || threadID == length-1){
+        result[threadId] = 0 ;
+    }
+    else{
+        if(data[threadId] > data[threadId-1] && data[threadId] > data[threadId+1]){
+            result[threadId] = 1;  
+        }
+        else result[threadId] = 0;
+    }
+}
 
+__global__
+void sub(int *data,int length, int *result){
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (threadId < length){
+        result[threadId] = data[threadId] - data[threadId-1];
+    }
+}
 
-
+__global__
+void collect_res(int *prefix_sum, int *indicate, int *result, int length){
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (threadId < length){
+        if (indicate[threadId] == 1){
+            result[prefix_sum[threadId]-1] = threadId;
+        }
+    }
+}
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
      * Finds all elements in the list that are greater than the elements before and after,
@@ -125,7 +192,24 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+    int blockSize = 512;
+    if (length <= blcokSize){
+        peak_check<<<1, length>>>(device_input, length, device_output);
+        exclusive_scan(device_output, length);
+        sub<<<1, length>>>(device_output, length, device_input);
+        collect_res<<<1, length>>>(device_output, device_input, device_output, length);        
+    } else{
+        int gridSize = (length + blockSize - 1) / blockSize;
+        peak_check<<<gridSize, blockSize>>>(device_input, length, device_output);
+        exclusive_scan(device_output, length);
+        sub<<<gridSize, blockSize>>>(device_output, length, device_input);
+        collect_res<<<gridSize, blockSize>>>(device_output, device_input, device_output, length);
+    }
+
+    int * res_num = new int;
+    cudaMemcpy(res_num, device_output + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    return *res_num;
 }
 
 
