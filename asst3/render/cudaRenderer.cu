@@ -1,15 +1,16 @@
 #include <string>
 #include <algorithm>
-#define _USE_MATH_DEFINES
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 
-
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+
+#define SCAN_BLOCK_DIM 256
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -56,6 +57,14 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+
+// shared memory
+const int smem_size = SCAN_BLOCK_DIM;
+__shared__ float4 smem_p_rad[smem_size];
+__shared__ float3 smem_colors[smem_size];
+__shared__ uint smem_scan_scratch[smem_size * 2];
+__shared__ uint smem_needs[smem_size];
+__shared__ uint smem_sums[smem_size];
 
 // Include parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -367,20 +376,15 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
         alpha = .5f;
     }
 
-    float oneMinusAlpha = 1.f - alpha;
+    // 计算 oneMinusAlpha
+    float existingAlpha = atomicAdd(&imagePtr->w, 0.0f);
+    float oneMinusAlpha = 1.0f - alpha * (1.0f - existingAlpha);
+    // 原子性更新每个颜色通道
+    atomicAdd(&imagePtr->x, alpha * rgb.x * oneMinusAlpha);
+    atomicAdd(&imagePtr->y, alpha * rgb.y * oneMinusAlpha);
+    atomicAdd(&imagePtr->z, alpha * rgb.z * oneMinusAlpha);
+    atomicAdd(&imagePtr->w, alpha);
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // Global memory write
-    *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -390,47 +394,107 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+
+/*
+ *采用分段处理的方式：将每个线程的计算结果存储在中间缓冲区中，并在完成所有线程的处理后，按照顺序将结果合并到最终输出中。
+ *1. 使用中间缓冲区
+ *每个线程计算其贡献值，并将结果存储在中间缓冲区（buffer）中，而不是直接写入输出图像。
+ *2. 按顺序合并结果
+ *在所有线程完成计算后，按线程 ID 的顺序遍历中间缓冲区，将每个线程的结果依次合并到最终的图像中，以保证顺序正确。  
+ *
+ */
+
+__device__ int nextPow2(int n)
+{
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 __global__ void kernelRenderCircles() {
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+   float4 img;
 
-    if (index >= cuConstRendererParams.numberOfCircles)
-        return;
+   const int threadid = threaIdx.y*blockDim.x + threadIdx.x;
+   const unsigned int globalIdX = blockIdx.x * blockDim.x + threadIdx.x;
+   const unsigned int globalIdY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int index3 = 3 * index;
+   const unsigned int x1 = blockIdx.x * blockDim.x;
+   const unsigned int x2 = x1 + blockDim.x;
+   const unsigned int y1 = blockIdx.y * blockDim.y;
+   const unsigned int y2 = y1 + blockDim.y;
 
-    // Read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+   short imageWidth = cuConstRendererParams.imageWidth;
+   short imageHeight = cuConstRendererParams.imageHeight;
 
-    // Compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+   float invWidth = 1.f / imageWidth;
+   float invHeight = 1.f / imageHeight;
 
-    // A bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+   int offset = 0;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+   img = _ldcs((float4*)(cuConstRendererParams.imageData)+(globalIdY*imageWidth+globalIdX)); 
 
-    // For all pixels in the bounding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(pixelCenterNorm, p, imgPtr, index);
-            imgPtr++;
+   for (int index = 0; index < cuConstRendererParams.numberOfCircles; index+=smem_size){
+       int size = min(smem_size, cuConstRendererParams.numberOfCircles-index);
+       int need_to_cal = 0;
+       float3 p,color;
+       float rad;
+       
+       if (threadid < size){
+           p = *((float3*)cuConstRendererParams.position +index+threadid);
+           color = *((float3*)cuConstRendererParams.color +index+threadid);
+           rad = *((float*)cuConstRendererParams.radius +index+threadid);
+
+           need_to_cal = circleBoxConservative(p.x,p.y, rad, x1*invWidth, y1*invHeight, x2*invWidth, y2*invHeight);
+       }
+
+       if (threadid < smem_size){
+        smem_sums[threadid] = need_cal;
+        smem_needs[threadid] = need_to_cal;
+       }
+
+       __syncthreads();
+       size = nextPow2(size);
+
+       sharedMemExclusiveScan(threadid,smem_needs,smem_sums,smem_scan_scratch,size);
+       __syncthreads();
+
+       size = smem_sums[size-1] + smem_needs[size-1];
+       if (offset + size > smem_size) {
+            for (int i = 0; i < offset; ++i) {
+                float4 p_rad = smem_p_rad[i];
+    
+                float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
+                                                     invHeight * (static_cast<float>(globalIdY) + 0.5f));
+                shadePixel(i, pixelCenterNorm, p_rad, &img);
+            }
+
+            offset = 0;
+        }
+
+        __syncthreads();
+        if (smem_needs[threadId] == 1 && threadId < smem_size) {
+            smem_p_rad[smem_sums[threadId] + offset] = make_float4(p.x, p.y, p.z, rad);
+            smem_colors[smem_sums[threadId] + offset] = color;
+        }
+        offset += size;
+    }
+    if (offset > 0) {
+        __syncthreads();
+        for (int i = 0; i < offset; ++i) {
+            float4 p_rad = smem_p_rad[i];
+            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
+                                                 invHeight * (static_cast<float>(globalIdY) + 0.5f));
+            shadePixel(i, pixelCenterNorm, p_rad, &img);
         }
     }
+
+    __stwt((float4*)(cuConstRendererParams.imageData)+(globalIdY*imageWidth+globalIdX),img); //atomatic write
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
